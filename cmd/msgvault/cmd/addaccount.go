@@ -745,6 +745,51 @@ func decideAddAccountGrant(
 	return addAccountGrantDecision{}
 }
 
+// refuseReadonlyUnderAliasSpelling fails a read-only run when a token is
+// stored under a Gmail alias spelling of email. Proceeding would mint or
+// reuse a read-only token for this spelling while the other spelling's
+// credential kept whatever access it has — reported as a successful
+// read-only setup.
+//
+// With no token under this spelling the remedy is simply to use the stored
+// one, where the normal grant decision applies. When both spellings hold
+// tokens, that redirect would bounce off the mirror-image refusal, so the
+// remedy is the same revoke-and-re-add procedure as any other narrowing —
+// revocation at Google clears the account's grant for the client, so both
+// credentials die together — with every duplicate file removed before the
+// single re-add.
+func refuseReadonlyUnderAliasSpelling(mgr *oauth.Manager, email string) error {
+	equivalents := mgr.FindEquivalentTokenEmails(email)
+	if len(equivalents) == 0 {
+		return nil
+	}
+	if !mgr.HasToken(email) {
+		return fmt.Errorf(
+			"%s refers to the same Google account as %s, which has a stored token\n"+
+				"A read-only setup under a second spelling would leave that token's "+
+				"access in place, unnarrowed.\n"+
+				"Use the stored spelling instead:\n"+
+				"  msgvault add-account %s --readonly",
+			email, equivalents[0], equivalents[0])
+	}
+	removals := []string{"  2. rm " + oauth.ShellQuote(mgr.TokenPath(email))}
+	for _, equivalent := range equivalents {
+		removals = append(removals, "     rm "+oauth.ShellQuote(mgr.TokenPath(equivalent)))
+	}
+	return fmt.Errorf(
+		"%s and %s hold stored tokens for the same Google account\n"+
+			"A read-only decision cannot be made while both exist.\n"+
+			"To make this account read-only, remove its access and grant it again:\n"+
+			"  1. Revoke msgvault at https://myaccount.google.com/permissions\n"+
+			"%s\n"+
+			"  3. msgvault add-account %s --readonly\n"+
+			"Revoking clears every other Google scope for this account, so re-run the\n"+
+			"commands that granted them (msgvault add-calendar, add-synctech-sms-drive).\n"+
+			"%s",
+		email, strings.Join(equivalents, ", "), strings.Join(removals, "\n"), email,
+		"Archived mail is not affected.")
+}
+
 // narrowingRemedy renders the way out of a refusal.
 //
 // Access already granted cannot be narrowed in place, and no flag changes that.
@@ -829,6 +874,16 @@ func applyHeadlessGrantDecision(cmd *cobra.Command, email, resolvedApp string) e
 // before --force deletes the token: once the token is gone there is no grant
 // left to compare against.
 func applyAddAccountGrantDecision(out io.Writer, mgr *oauth.Manager, email string) error {
+	// Authorization accepts Gmail alias spellings (dots, plus-addresses,
+	// case, googlemail.com) as the same account, so a read-only decision
+	// must not treat an exact-match miss as a fresh account while an
+	// equivalent spelling holds a credential. Refused for --readonly only;
+	// default runs keep their existing behavior.
+	if readonlyGrant {
+		if err := refuseReadonlyUnderAliasSpelling(mgr, email); err != nil {
+			return err
+		}
+	}
 	// The token's own client_id is the whole question: a grant belonging to a
 	// different client is not one --readonly could narrow. Deliberately not
 	// gated on bindingChanged, which requires an existing source row and so

@@ -75,6 +75,10 @@ Revoking clears every other Google scope for the account, so re-run whichever co
 
 The same refusal applies to an account holding the broad `https://mail.google.com/` scope, which msgvault grants when you escalate for permanent deletion.
 
+The refusal also fires when the token is stored under a Gmail alias spelling of the address you typed (dots, `+suffix`, `googlemail.com`) — Google treats those as the same account, so setting up a second spelling read-only would leave the stored spelling's access in place. The message names the stored spelling to use, or the full revoke-and-re-add procedure when both spellings hold tokens.
+
+`msgvault remove-account` revokes the account's Google grant (best-effort) before deleting its token file, so removing an account and re-adding it with `--readonly` yields a genuinely fresh, read-only grant.
+
 #### "currently has read-only Gmail access"
 
 A plain `add-account` run against a read-only account warns before requesting write access again. Re-run with `--readonly` to keep the narrower grant. Running `add-account --readonly` against an account that is already read-only does nothing and reuses the existing token.

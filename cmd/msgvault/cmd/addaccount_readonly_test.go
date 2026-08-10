@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -722,4 +723,64 @@ func TestAddAccount_NoWarningForBrandNewAccount(t *testing.T) {
 	require.Error(t, err, "browser authorization cannot complete on a cancelled context")
 	assert.NotContains(t, out, "read-only Gmail access")
 	assert.NotContains(t, out, "Warning")
+}
+
+// TestAddAccount_ReadonlyRefusesAliasOfStoredToken: authorization accepts
+// Gmail alias spellings as the same account, so a --readonly run under a
+// dot-variant of a stored token must refuse rather than read as a fresh
+// account while the stored spelling's credential keeps its access. When both
+// spellings hold tokens, the refusal names the revoke-and-re-add procedure
+// instead of bouncing between the two spellings.
+func TestAddAccount_ReadonlyRefusesAliasOfStoredToken(t *testing.T) {
+	seedAliasToken := func(t *testing.T) {
+		t.Helper()
+		require.NoError(t, os.WriteFile(
+			filepath.Join(cfg.TokensDir(), "username@gmail.com.json"),
+			[]byte(gmailOnlyTokenJSON), 0600))
+	}
+
+	t.Run("alias of a stored token points at the stored spelling", func(t *testing.T) {
+		saveAddAccountFlags(t)
+		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
+		defer restore()
+		seedAliasToken(t)
+
+		out, err := runAddAccountForTest(t, "user.name@gmail.com", "--readonly", "--no-default-identity")
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "username@gmail.com")
+		assert.NotContains(t, out, "Starting browser authorization")
+	})
+
+	t.Run("duplicate spellings name the revoke-and-re-add procedure", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+
+		saveAddAccountFlags(t)
+		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
+		defer restore()
+		seedAliasToken(t)
+		require.NoError(os.WriteFile(
+			filepath.Join(cfg.TokensDir(), "user.name@gmail.com.json"),
+			[]byte(gmailReadonlyTokenJSON), 0600))
+
+		out, err := runAddAccountForTest(t, "user.name@gmail.com", "--readonly", "--no-default-identity")
+
+		require.Error(err)
+		assert.Contains(err.Error(), "myaccount.google.com/permissions")
+		assert.Contains(err.Error(), "username@gmail.com")
+		assert.NotContains(out, "Starting browser authorization")
+	})
+
+	t.Run("default run ignores alias spellings", func(t *testing.T) {
+		saveAddAccountFlags(t)
+		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
+		defer restore()
+		seedAliasToken(t)
+
+		_, err := runAddAccountForTest(t, "user.name@gmail.com", "--no-default-identity")
+
+		require.Error(t, err, "browser authorization cannot complete on a cancelled context")
+		assert.NotContains(t, err.Error(), "username@gmail.com")
+	})
 }

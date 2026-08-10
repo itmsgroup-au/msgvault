@@ -234,6 +234,7 @@ type Manager struct {
 	tokensDir  string
 	logger     *slog.Logger
 	profileURL string // profile endpoint override for tests
+	revokeURL  string // revocation endpoint override for tests
 
 	// browserFlowFn overrides browserFlow in tests to avoid starting
 	// a real HTTP server and browser. When nil, the real browserFlow
@@ -1215,6 +1216,122 @@ func fetchTokenProfileEmailFromEndpoint(
 func ValidateTokenEmail(ctx context.Context, ts oauth2.TokenSource, email string) error {
 	_, err := fetchTokenProfileEmail(ctx, ts, defaultProfileURL, email, tokenProfileErrorServiceAccount)
 	return err
+}
+
+// revokeTimeout bounds the revocation request; revocation is a single POST
+// and should not hang a CLI command on a stalled connection.
+const revokeTimeout = 15 * time.Second
+
+const defaultRevokeURL = "https://oauth2.googleapis.com/revoke"
+
+// ErrRevokeCredentialInvalid reports that the revocation endpoint rejected
+// the stored credential as already expired or revoked. Callers treating
+// revocation as cleanup (account removal) can read it as nothing-to-do.
+var ErrRevokeCredentialInvalid = errors.New("stored credential is already expired or revoked")
+
+// RevokeToken revokes the stored grant at Google's revocation endpoint.
+// Revoking the refresh token invalidates the grant server-side, so copies of
+// the token file (backups, other hosts, previously exposed credentials) lose
+// access too — deleting the local file alone would not achieve that.
+func (m *Manager) RevokeToken(ctx context.Context, email string) error {
+	tf, err := m.loadTokenFile(email)
+	if err != nil {
+		return fmt.Errorf("load token for %s: %w", email, err)
+	}
+	credential := tf.RefreshToken
+	if credential == "" {
+		credential = tf.AccessToken
+	}
+	if credential == "" {
+		return fmt.Errorf("token for %s holds no credential to revoke", email)
+	}
+
+	endpoint := m.revokeURL
+	if endpoint == "" {
+		endpoint = defaultRevokeURL
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, revokeTimeout)
+	defer cancel()
+	form := url.Values{"token": {credential}}
+	req, err := http.NewRequestWithContext(
+		reqCtx, http.MethodPost, endpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return fmt.Errorf("create revocation request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke token for %s: %w", email, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusBadRequest {
+		var apiErr struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(body, &apiErr) == nil && apiErr.Error == "invalid_token" {
+			return fmt.Errorf("revoke token for %s: %w", email, ErrRevokeCredentialInvalid)
+		}
+	}
+	return fmt.Errorf(
+		"revoke token for %s: revocation endpoint returned HTTP %d: %s",
+		email, resp.StatusCode, strings.TrimSpace(string(body)))
+}
+
+// RevokeStoredCredential revokes the credential stored for email in
+// tokensDir at Google's revocation endpoint. Revocation needs no OAuth
+// client configuration — the endpoint takes only the token — so account
+// removal can retire the grant before deleting the file even when no
+// client secrets are configured. Behavior matches Manager.RevokeToken.
+func RevokeStoredCredential(ctx context.Context, tokensDir, email string) error {
+	m := &Manager{tokensDir: tokensDir, logger: slog.Default(), config: &oauth2.Config{}}
+	return m.RevokeToken(ctx, email)
+}
+
+// FindEquivalentTokenEmails returns every stored spelling other than email
+// itself that refers to the same Google account under Gmail's alias rules —
+// case, dots, plus-addresses, googlemail.com.
+//
+// Read-only decisions use this to fail closed: authorization accepts alias
+// variants (sameGoogleAccount), so without this check a --readonly run
+// through an alias spelling would read as a fresh account while an
+// equivalent stored spelling kept an unnarrowed, possibly write-capable
+// credential.
+//
+// A candidate that is the account's own file does not count. On
+// case-insensitive filesystems a case-variant filename resolves to the same
+// file as the exact spelling, so candidates are also compared by identity
+// (os.SameFile), not just by name.
+func (m *Manager) FindEquivalentTokenEmails(email string) []string {
+	entries, err := os.ReadDir(m.tokensDir)
+	if err != nil {
+		return nil
+	}
+	own := sanitizeEmail(email) + ".json"
+	ownInfo, ownErr := os.Stat(filepath.Join(m.tokensDir, own))
+	var equivalents []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".json") || name == own {
+			continue
+		}
+		if ownErr == nil {
+			if info, infoErr := entry.Info(); infoErr == nil && os.SameFile(ownInfo, info) {
+				continue
+			}
+		}
+		stored := strings.TrimSuffix(name, ".json")
+		if sameGoogleAccount(email, stored) {
+			equivalents = append(equivalents, stored)
+		}
+	}
+	return equivalents
 }
 
 // DeleteToken removes the token file for the given email.
